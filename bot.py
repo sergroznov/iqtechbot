@@ -21,12 +21,14 @@ import qrcode
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
+    FSInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -47,6 +49,7 @@ DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 FLYER_DAYS = int(os.getenv("FLYER_DAYS", "30"))
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
 SC_NAME = os.getenv("SC_NAME", "наш сервисный центр")
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
 SERVICES = {
     "film": "Поклейка плёнки на экран",
@@ -283,28 +286,48 @@ async def send_flyer(bot: Bot, uid: int, f):
     )
 
 
-async def client_entry(bot: Bot, uid: int, state: FSMContext):
+def welcome_image():
+    for ext in ("jpg", "jpeg", "png"):
+        p = os.path.join(ASSETS_DIR, f"welcome.{ext}")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+async def send_welcome(bot: Bot, uid: int, text: str, kb, with_image: bool):
+    """Сообщение с картинкой-приветствием (если файл есть), иначе просто текст."""
+    path = welcome_image() if with_image else None
+    if path:
+        try:
+            await bot.send_photo(uid, FSInputFile(path), caption=text, reply_markup=kb)
+            return
+        except Exception as e:
+            log.warning("welcome image failed: %s", e)
+    await bot.send_message(uid, text, reply_markup=kb)
+
+
+async def client_entry(bot: Bot, uid: int, state: FSMContext, with_image: bool = True):
     f = await get_flyer_by_tg(uid)
     if f:
         await send_flyer(bot, uid, f)
         return
     if not await is_subscribed(bot, uid):
-        await bot.send_message(
-            uid,
+        await send_welcome(
+            bot, uid,
             f"👋 Добро пожаловать в {esc(SC_NAME)}!\n\n"
             "Для получения подарочного флаера подпишитесь на наш канал, "
             "затем нажмите «Я подписался».",
-            reply_markup=sub_kb(),
+            sub_kb(), with_image,
         )
         return
     await state.set_state(Form.phone)
-    await bot.send_message(
-        uid,
+    await send_welcome(
+        bot, uid,
         "Отлично, подписка есть! 🎉\n\n"
         "Нажмите кнопку ниже, чтобы отправить номер телефона. "
         "Отправляя номер, вы соглашаетесь на обработку персональных данных "
         "для оформления флаера.",
-        reply_markup=phone_kb(),
+        phone_kb(), with_image,
     )
 
 
@@ -317,7 +340,7 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
         if arg.startswith("f_"):
             await show_redeem_card(m.bot, uid, arg[2:].upper())
         else:
-            await m.answer(STAFF_HELP)
+            await show_panel(m.bot, m.chat.id, uid)
         return
     await client_entry(m.bot, uid, state)
 
@@ -330,7 +353,7 @@ async def cb_check_sub(c: CallbackQuery, state: FSMContext):
         await c.answer("Подписка не найдена. Подпишитесь и нажмите ещё раз.", show_alert=True)
         return
     await c.answer()
-    await client_entry(c.bot, c.from_user.id, state)
+    await client_entry(c.bot, c.from_user.id, state, with_image=False)
 
 
 @router.message(Form.phone, F.contact)
@@ -389,7 +412,7 @@ async def got_service(c: CallbackQuery, state: FSMContext):
     if not await is_subscribed(c.bot, uid):
         await state.clear()
         await c.answer()
-        await client_entry(c.bot, uid, state)
+        await client_entry(c.bot, uid, state, with_image=False)
         return
     username = f"@{c.from_user.username}" if c.from_user.username else ""
     code = await create_flyer(
@@ -410,17 +433,10 @@ async def service_wrong(m: Message):
 
 
 # -------------------------------------------------------------- сотрудники
-STAFF_HELP = (
-    "🛠 <b>Панель сотрудника</b>\n\n"
-    "Отсканируйте QR клиента камерой телефона — откроется этот бот с карточкой "
-    "флаера и кнопкой «Погасить».\n\n"
-    "/check КОД — найти флаер вручную по коду\n"
-    "/stats — статистика\n"
-    "/export — выгрузка всех флаеров в CSV (админ)\n"
-    "/addstaff ID — добавить сотрудника (админ)\n"
-    "/delstaff ID — убрать сотрудника (админ)\n"
-    "/staff — список сотрудников (админ)"
-)
+class Staff(StatesGroup):
+    code = State()
+    add_id = State()
+
 
 STATUS_TXT = {
     "active": "🟢 Действителен",
@@ -429,11 +445,52 @@ STATUS_TXT = {
 }
 
 
-async def show_redeem_card(bot: Bot, chat_id: int, code: str):
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+MENU_ROW = [btn("🏠 В меню", "p:menu")]
+
+
+def menu_text() -> str:
+    return (
+        "🛠 <b>Панель сотрудника</b>\n\n"
+        "Выберите действие кнопкой ниже.\n"
+        "Чтобы погасить флаер, просто отсканируйте QR клиента камерой телефона."
+    )
+
+
+def menu_kb(admin: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [btn("🔎 Найти флаер по коду", "p:code")],
+        [btn("📊 Статистика", "p:stats"), btn("🕘 Последние погашения", "p:last")],
+    ]
+    if admin:
+        rows.append([btn("👥 Сотрудники", "p:staff"), btn("📥 Выгрузка CSV", "p:export")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_of(*rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
+
+
+async def show_panel(bot: Bot, chat_id: int, uid: int):
+    await bot.send_message(chat_id, menu_text(), reply_markup=menu_kb(uid in ADMIN_IDS))
+
+
+async def panel_edit(bot: Bot, chat_id: int, msg_id: int, text: str, kb=None):
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id,
+                                    reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            log.warning("edit failed: %s", e)
+
+
+async def build_card(bot: Bot, code: str):
     f = await get_flyer(code)
     if not f:
-        await bot.send_message(chat_id, "❌ Флаер с таким кодом не найден.")
-        return
+        return "❌ Флаер с таким кодом не найден.", kb_of(MENU_ROW)
     st = eff_status(f)
     subscribed = await is_subscribed(bot, f["tg_id"])
     text = (
@@ -449,12 +506,15 @@ async def show_redeem_card(bot: Bot, chat_id: int, code: str):
     )
     if st == "redeemed":
         text += f"\nПогашен: {fmt(f['redeemed_at'])}"
-    kb = None
+    rows = []
     if st == "active":
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(
-                text="✅ Погасить флаер", callback_data=f"rd:{f['code']}")]]
-        )
+        rows.append([btn("✅ Погасить флаер", f"rd:{f['code']}")])
+    rows.append(MENU_ROW)
+    return text, kb_of(*rows)
+
+
+async def show_redeem_card(bot: Bot, chat_id: int, code: str):
+    text, kb = await build_card(bot, code)
     await bot.send_message(chat_id, text, reply_markup=kb)
 
 
@@ -465,56 +525,41 @@ async def cb_redeem(c: CallbackQuery):
         return
     code = c.data.split(":", 1)[1]
     res, f = await redeem(code, c.from_user.id)
+    back = kb_of(MENU_ROW)
     if res == "ok":
         await c.answer("Флаер погашен ✅", show_alert=True)
         await c.message.edit_text(
             c.message.html_text + f"\n\n✅ <b>Погашено</b> {fmt(f['redeemed_at'])}",
-            reply_markup=None,
+            reply_markup=back,
         )
         try:
             await c.bot.send_message(
                 f["tg_id"],
-                "✅ Флаер использован. Спасибо, что выбрали нас! "
-                "Ждём вас снова 🙌",
+                "✅ Флаер использован. Спасибо, что выбрали нас! Ждём вас снова 🙌",
             )
         except Exception:
             pass
     elif res == "used":
         await c.answer("Этот флаер уже был использован!", show_alert=True)
-        await c.message.edit_reply_markup(reply_markup=None)
+        await c.message.edit_reply_markup(reply_markup=back)
     elif res == "expired":
         await c.answer("Срок действия флаера истёк", show_alert=True)
-        await c.message.edit_reply_markup(reply_markup=None)
+        await c.message.edit_reply_markup(reply_markup=back)
     else:
         await c.answer("Флаер не найден", show_alert=True)
 
 
-@router.message(Command("check"))
-async def cmd_check(m: Message, command: CommandObject):
-    if not await is_staff(m.from_user.id):
-        return
-    code = (command.args or "").strip().upper()
-    if not code:
-        await m.answer("Использование: /check КОД")
-        return
-    await show_redeem_card(m.bot, m.from_user.id, code)
-
-
-@router.message(Command("stats"))
-async def cmd_stats(m: Message):
-    if not await is_staff(m.from_user.id):
-        return
+async def stats_text() -> str:
     now = now_utc()
     total = (await fetchone("SELECT COUNT(*) n FROM flyers"))["n"]
     used = (await fetchone("SELECT COUNT(*) n FROM flyers WHERE status='redeemed'"))["n"]
     expired = (await fetchone(
         "SELECT COUNT(*) n FROM flyers WHERE status='active' AND expires_at<?", (now,)))["n"]
-    active = total - used - expired
     lines = [
         "📊 <b>Статистика</b>",
         f"Выдано флаеров: {total}",
         f"Погашено: {used}",
-        f"Активных: {active}",
+        f"Активных: {total - used - expired}",
         f"Просрочено: {expired}",
         "",
         "<b>По услугам (выдано / погашено):</b>",
@@ -524,13 +569,25 @@ async def cmd_stats(m: Message):
         u = (await fetchone(
             "SELECT COUNT(*) n FROM flyers WHERE service=? AND status='redeemed'", (key,)))["n"]
         lines.append(f"{esc(name)}: {t} / {u}")
-    await m.answer("\n".join(lines))
+    return "\n".join(lines)
 
 
-@router.message(Command("export"))
-async def cmd_export(m: Message):
-    if m.from_user.id not in ADMIN_IDS:
-        return
+async def last_text() -> str:
+    rows = await fetchall(
+        "SELECT * FROM flyers WHERE status='redeemed' ORDER BY redeemed_at DESC LIMIT 10")
+    if not rows:
+        return "🕘 <b>Последние погашения</b>\n\nПока ни один флаер не погашен."
+    lines = ["🕘 <b>Последние погашения</b>\n"]
+    for r in rows:
+        lines.append(
+            f"{fmt(r['redeemed_at'])} · <code>{r['code']}</code>\n"
+            f"   {esc(r['full_name'])} · {esc(r['device'])} · "
+            f"{esc(SERVICES.get(r['service'], r['service']))}"
+        )
+    return "\n".join(lines)
+
+
+async def export_csv() -> bytes:
     rows = await fetchall("SELECT * FROM flyers ORDER BY id")
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
@@ -543,44 +600,157 @@ async def cmd_export(m: Message):
             fmt(r["created_at"]), fmt(r["expires_at"]),
             fmt(r["redeemed_at"]) if r["redeemed_at"] else "", r["redeemed_by"] or "",
         ])
-    data = ("\ufeff" + buf.getvalue()).encode("utf-8")  # BOM для Excel
-    await m.answer_document(BufferedInputFile(data, filename="flyers.csv"))
+    return ("﻿" + buf.getvalue()).encode("utf-8")  # BOM для Excel
 
 
-@router.message(Command("addstaff"))
-async def cmd_addstaff(m: Message, command: CommandObject):
+async def staff_screen(note: str = ""):
+    rows = await fetchall("SELECT * FROM staff ORDER BY added_at")
+    admins = ", ".join(f"<code>{i}</code>" for i in sorted(ADMIN_IDS)) or "—"
+    text = (note + "\n\n" if note else "") + "👥 <b>Сотрудники</b>\n\n" \
+        f"Админы (задаются в настройках): {admins}\n\n"
+    if rows:
+        text += "Сотрудники — нажмите на имя, чтобы удалить:"
+    else:
+        text += "Сотрудников пока нет."
+    kb_rows = [
+        [btn(f"❌ {r['name'] or r['tg_id']} ({r['tg_id']})", f"p:del:{r['tg_id']}")]
+        for r in rows
+    ]
+    kb_rows.append([btn("➕ Добавить сотрудника", "p:add")])
+    kb_rows.append(MENU_ROW)
+    return text, kb_of(*kb_rows)
+
+
+@router.callback_query(F.data.startswith("p:"))
+async def cb_panel(c: CallbackQuery, state: FSMContext):
+    uid = c.from_user.id
+    if not await is_staff(uid):
+        await c.answer("Нет доступа", show_alert=True)
+        return
+    admin = uid in ADMIN_IDS
+    action = c.data[2:]
+    bot, chat, mid = c.bot, c.message.chat.id, c.message.message_id
+    await c.answer()
+
+    if action == "menu":
+        await state.clear()
+        await panel_edit(bot, chat, mid, menu_text(), menu_kb(admin))
+    elif action == "code":
+        await state.set_state(Staff.code)
+        await state.update_data(panel=mid)
+        await panel_edit(
+            bot, chat, mid,
+            "🔎 <b>Поиск флаера</b>\n\nОтправьте код флаера (10 символов, "
+            "указан под QR-кодом у клиента).",
+            kb_of([btn("✖️ Отмена", "p:menu")]),
+        )
+    elif action == "stats":
+        await panel_edit(bot, chat, mid, await stats_text(),
+                         kb_of([btn("🔄 Обновить", "p:stats")], MENU_ROW))
+    elif action == "last":
+        await panel_edit(bot, chat, mid, await last_text(),
+                         kb_of([btn("🔄 Обновить", "p:last")], MENU_ROW))
+    elif action == "export" and admin:
+        await bot.send_document(chat, BufferedInputFile(await export_csv(),
+                                                        filename="flyers.csv"))
+    elif action == "staff" and admin:
+        await state.clear()
+        text, kb = await staff_screen()
+        await panel_edit(bot, chat, mid, text, kb)
+    elif action == "add" and admin:
+        await state.set_state(Staff.add_id)
+        await state.update_data(panel=mid)
+        await panel_edit(
+            bot, chat, mid,
+            "➕ <b>Добавить сотрудника</b>\n\nОтправьте Telegram ID сотрудника (число). "
+            "Узнать его можно у бота @userinfobot.",
+            kb_of([btn("✖️ Отмена", "p:staff")]),
+        )
+    elif action.startswith("del:") and admin:
+        tid = int(action.split(":")[1])
+        await panel_edit(
+            bot, chat, mid, f"Удалить сотрудника <code>{tid}</code>?",
+            kb_of([btn("✅ Да, удалить", f"p:deldo:{tid}"), btn("↩️ Нет", "p:staff")]),
+        )
+    elif action.startswith("deldo:") and admin:
+        tid = int(action.split(":")[1])
+        await execute("DELETE FROM staff WHERE tg_id=?", (tid,))
+        text, kb = await staff_screen(f"Сотрудник {tid} удалён")
+        await panel_edit(bot, chat, mid, text, kb)
+
+
+@router.message(Staff.code, F.text)
+async def staff_code_input(m: Message, state: FSMContext):
+    if not await is_staff(m.from_user.id):
+        return
+    panel = (await state.get_data()).get("panel")
+    await state.clear()
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    code = re.sub(r"\s+", "", m.text).upper()
+    text, kb = await build_card(m.bot, code)
+    if panel:
+        await panel_edit(m.bot, m.chat.id, panel, text, kb)
+    else:
+        await m.answer(text, reply_markup=kb)
+
+
+@router.message(Staff.add_id, F.text)
+async def staff_add_input(m: Message, state: FSMContext):
     if m.from_user.id not in ADMIN_IDS:
         return
-    nums = re.findall(r"\d+", command.args or "")
-    if not nums:
-        await m.answer("Использование: /addstaff TELEGRAM_ID\n"
-                       "ID можно узнать у бота @userinfobot")
+    panel = (await state.get_data()).get("panel")
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    nums = re.findall(r"\d+", m.text)
+    if not nums or len(nums[0]) < 5:
+        if panel:
+            await panel_edit(
+                m.bot, m.chat.id, panel,
+                "❌ Это не похоже на Telegram ID. Отправьте число, например "
+                "<code>123456789</code>.",
+                kb_of([btn("✖️ Отмена", "p:staff")]),
+            )
         return
-    await execute("INSERT OR IGNORE INTO staff(tg_id,name,added_at) VALUES(?,?,?)",
-                  (int(nums[0]), "", now_utc()))
-    await m.answer(f"Сотрудник {nums[0]} добавлен ✅")
+    tid = int(nums[0])
+    await state.clear()
+    if tid in ADMIN_IDS:
+        note = f"ℹ️ {tid} уже админ, добавлять не нужно."
+    else:
+        name = ""
+        try:
+            ch = await m.bot.get_chat(tid)
+            name = " ".join(filter(None, [ch.first_name, ch.last_name]))
+            if ch.username:
+                name += f" @{ch.username}"
+        except Exception:
+            pass
+        await execute("INSERT OR REPLACE INTO staff(tg_id,name,added_at) VALUES(?,?,?)",
+                      (tid, name.strip(), now_utc()))
+        try:
+            await m.bot.send_message(
+                tid, "✅ Вас добавили как сотрудника. Нажмите /start, чтобы открыть панель.")
+            note = f"✅ Сотрудник {tid} добавлен, уведомление отправлено."
+        except Exception:
+            note = (f"✅ Сотрудник {tid} добавлен. Пусть он откроет бота и нажмёт "
+                    "/start — сейчас бот не смог ему написать.")
+    text, kb = await staff_screen(note)
+    if panel:
+        await panel_edit(m.bot, m.chat.id, panel, text, kb)
+    else:
+        await m.answer(text, reply_markup=kb)
 
 
-@router.message(Command("delstaff"))
-async def cmd_delstaff(m: Message, command: CommandObject):
-    if m.from_user.id not in ADMIN_IDS:
+@router.message(Command("menu"))
+async def cmd_menu(m: Message, state: FSMContext):
+    if not await is_staff(m.from_user.id):
         return
-    nums = re.findall(r"\d+", command.args or "")
-    if not nums:
-        await m.answer("Использование: /delstaff TELEGRAM_ID")
-        return
-    await execute("DELETE FROM staff WHERE tg_id=?", (int(nums[0]),))
-    await m.answer(f"Сотрудник {nums[0]} удалён")
-
-
-@router.message(Command("staff"))
-async def cmd_staff(m: Message):
-    if m.from_user.id not in ADMIN_IDS:
-        return
-    rows = await fetchall("SELECT tg_id FROM staff ORDER BY added_at")
-    admins = ", ".join(map(str, sorted(ADMIN_IDS))) or "—"
-    staff = ", ".join(str(r["tg_id"]) for r in rows) or "—"
-    await m.answer(f"Админы: {admins}\nСотрудники: {staff}")
+    await state.clear()
+    await show_panel(m.bot, m.chat.id, m.from_user.id)
 
 
 # ------------------------------------------------------------------- запуск
