@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram flyer bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flyerbot
+WorkingDirectory=/opt/flyerbot
+EnvironmentFile=/opt/flyerbot/.env
+ExecStart=/opt/flyerbot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
