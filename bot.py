@@ -49,6 +49,7 @@ DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 FLYER_DAYS = int(os.getenv("FLYER_DAYS", "30"))
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
 SC_NAME = os.getenv("SC_NAME", "наш сервисный центр")
+INVITE_DAYS = int(os.getenv("INVITE_DAYS", "14"))
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
 SERVICES = {
@@ -121,6 +122,26 @@ CREATE TABLE IF NOT EXISTS staff(
     name TEXT,
     added_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS clients(
+    tg_id INTEGER PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    phone TEXT,
+    segment TEXT NOT NULL DEFAULT 'client',   -- client | mall (сотрудник ТЦ)
+    company TEXT,
+    created_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invites(
+    code TEXT PRIMARY KEY,
+    company TEXT NOT NULL,
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    claimed_by INTEGER,
+    claimed_at TEXT,
+    used_at TEXT
+);
 """
 
 
@@ -131,6 +152,10 @@ async def init_db():
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.executescript(SCHEMA)
+    # миграция: все, кто уже получил флаер, становятся профилями «обычный клиент»
+    await db.execute(
+        "INSERT OR IGNORE INTO clients(tg_id,username,full_name,phone,segment,created_at,last_seen) "
+        "SELECT tg_id,username,full_name,phone,'client',created_at,created_at FROM flyers")
     await db.commit()
 
 
@@ -168,6 +193,70 @@ def eff_status(f) -> str:
     if f["status"] == "active" and f["expires_at"] < now_utc():
         return "expired"
     return f["status"]
+
+
+SEGMENT_TXT = {"client": "Обычный клиент", "mall": "Сотрудник ТЦ"}
+
+
+async def touch_client(user):
+    """Запоминает клиента при любом заходе (ник/имя обновляются)."""
+    username = f"@{user.username}" if user.username else ""
+    now = now_utc()
+    await execute(
+        "INSERT INTO clients(tg_id,username,full_name,created_at,last_seen) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username, "
+        "full_name=excluded.full_name, last_seen=excluded.last_seen",
+        (user.id, username, user.full_name, now, now),
+    )
+
+
+async def set_client_phone(tg_id: int, phone: str):
+    await execute("UPDATE clients SET phone=? WHERE tg_id=?", (phone, tg_id))
+
+
+async def get_client(tg_id: int):
+    return await fetchone("SELECT * FROM clients WHERE tg_id=?", (tg_id,))
+
+
+async def create_invite(company: str, created_by: int) -> str:
+    code = secrets.token_hex(6).upper()
+    now = datetime.now(timezone.utc)
+    await execute(
+        "INSERT INTO invites(code,company,created_by,created_at,expires_at) VALUES(?,?,?,?,?)",
+        (code, company, created_by, now.strftime("%Y-%m-%dT%H:%M:%S"),
+         (now + timedelta(days=INVITE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")),
+    )
+    return code
+
+
+async def claim_invite(code: str, tg_id: int) -> str:
+    """Закрепляет одноразовую ссылку за первым, кто её открыл. ok | used | expired | bad"""
+    inv = await fetchone("SELECT * FROM invites WHERE code=?", (code,))
+    if not inv:
+        return "bad"
+    if inv["claimed_by"] == tg_id:
+        return "ok"          # тот же человек вернулся по своей ссылке
+    if inv["claimed_by"] is not None:
+        return "used"
+    if inv["expires_at"] < now_utc():
+        return "expired"
+    n = await execute(
+        "UPDATE invites SET claimed_by=?, claimed_at=? WHERE code=? AND claimed_by IS NULL",
+        (tg_id, now_utc(), code),
+    )
+    return "ok" if n else "used"
+
+
+async def finalize_invite(tg_id: int):
+    """После оформления флаера помечает клиента сотрудником ТЦ (если он пришёл по спец-ссылке)."""
+    inv = await fetchone(
+        "SELECT * FROM invites WHERE claimed_by=? AND used_at IS NULL "
+        "ORDER BY claimed_at DESC LIMIT 1", (tg_id,))
+    if not inv:
+        return
+    await execute("UPDATE clients SET segment='mall', company=? WHERE tg_id=?",
+                  (inv["company"], tg_id))
+    await execute("UPDATE invites SET used_at=? WHERE code=?", (now_utc(), inv["code"]))
 
 
 async def create_flyer(tg_id, username, full_name, phone, device, service):
@@ -342,6 +431,14 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
         else:
             await show_panel(m.bot, m.chat.id, uid)
         return
+    await touch_client(m.from_user)
+    if arg.startswith("i_") and await get_flyer_by_tg(uid) is None:
+        res = await claim_invite(arg[2:].upper(), uid)
+        if res != "ok":
+            await m.answer(
+                "⚠️ Эта персональная ссылка уже использована или недействительна. "
+                "Вы можете получить флаер как обычный клиент."
+            )
     await client_entry(m.bot, uid, state)
 
 
@@ -363,6 +460,8 @@ async def got_phone(m: Message, state: FSMContext):
                        reply_markup=phone_kb())
         return
     phone = norm_phone(m.contact.phone_number)
+    await touch_client(m.from_user)
+    await set_client_phone(m.from_user.id, phone)
     if await phone_taken(phone):
         await state.clear()
         await m.answer(
@@ -423,6 +522,8 @@ async def got_service(c: CallbackQuery, state: FSMContext):
     if not code:
         await c.message.answer("Флаер для вас или для этого номера уже оформлен.")
         return
+    await touch_client(c.from_user)
+    await finalize_invite(uid)
     await c.message.edit_reply_markup(reply_markup=None)
     await send_flyer(c.bot, uid, await get_flyer(code))
 
@@ -436,6 +537,7 @@ async def service_wrong(m: Message):
 class Staff(StatesGroup):
     code = State()
     add_id = State()
+    invite = State()
 
 
 STATUS_TXT = {
@@ -464,6 +566,7 @@ def menu_kb(admin: bool) -> InlineKeyboardMarkup:
     rows = [
         [btn("🔎 Найти флаер по коду", "p:code")],
         [btn("📊 Статистика", "p:stats"), btn("🕘 Последние погашения", "p:last")],
+        [btn("🔗 Спец-ссылка для сотрудника ТЦ", "p:inv")],
     ]
     if admin:
         rows.append([btn("👥 Сотрудники", "p:staff"), btn("📥 Выгрузка CSV", "p:export")])
@@ -493,9 +596,14 @@ async def build_card(bot: Bot, code: str):
         return "❌ Флаер с таким кодом не найден.", kb_of(MENU_ROW)
     st = eff_status(f)
     subscribed = await is_subscribed(bot, f["tg_id"])
+    cl = await get_client(f["tg_id"])
+    plate = ""
+    if cl and cl["segment"] == "mall":
+        plate = (f"🏬 <b>СОТРУДНИК ТЦ · {esc(cl['company'])}</b>\n"
+                 "Тарифы для сотрудников ТЦ, сверьте бейдж/пропуск.\n\n")
     text = (
         f"🎟 <b>Флаер {f['code']}</b>\n"
-        f"Статус: <b>{STATUS_TXT[st]}</b>\n\n"
+        f"Статус: <b>{STATUS_TXT[st]}</b>\n\n" + plate +
         f"Услуга: <b>{esc(SERVICES.get(f['service'], f['service']))}</b>\n"
         f"Клиент: {esc(f['full_name'])} {esc(f['username'])}\n"
         f"Телефон: +{esc(f['phone'])}\n"
@@ -569,36 +677,58 @@ async def stats_text() -> str:
         u = (await fetchone(
             "SELECT COUNT(*) n FROM flyers WHERE service=? AND status='redeemed'", (key,)))["n"]
         lines.append(f"{esc(name)}: {t} / {u}")
+    lines += ["", "<b>По клиентам (выдано / погашено):</b>"]
+    seg = await fetchall(
+        "SELECT COALESCE(c.segment,'client') seg, COUNT(*) t, "
+        "SUM(CASE WHEN f.status='redeemed' THEN 1 ELSE 0 END) u "
+        "FROM flyers f LEFT JOIN clients c ON c.tg_id=f.tg_id GROUP BY seg")
+    d = {r["seg"]: (r["t"], r["u"]) for r in seg}
+    for key in ("client", "mall"):
+        t, u = d.get(key, (0, 0))
+        lines.append(f"{SEGMENT_TXT[key]}: {t} / {u}")
+    comp = await fetchall(
+        "SELECT c.company co, COUNT(*) t, "
+        "SUM(CASE WHEN f.status='redeemed' THEN 1 ELSE 0 END) u "
+        "FROM flyers f JOIN clients c ON c.tg_id=f.tg_id "
+        "WHERE c.segment='mall' GROUP BY c.company ORDER BY t DESC LIMIT 15")
+    if comp:
+        lines += ["", "<b>Компании ТЦ (выдано / погашено):</b>"]
+        lines += [f"{esc(r['co'])}: {r['t']} / {r['u']}" for r in comp]
     return "\n".join(lines)
 
 
 async def last_text() -> str:
     rows = await fetchall(
-        "SELECT * FROM flyers WHERE status='redeemed' ORDER BY redeemed_at DESC LIMIT 10")
+        "SELECT f.*, c.segment seg, c.company comp FROM flyers f "
+        "LEFT JOIN clients c ON c.tg_id=f.tg_id "
+        "WHERE f.status='redeemed' ORDER BY f.redeemed_at DESC LIMIT 10")
     if not rows:
         return "🕘 <b>Последние погашения</b>\n\nПока ни один флаер не погашен."
     lines = ["🕘 <b>Последние погашения</b>\n"]
     for r in rows:
         lines.append(
             f"{fmt(r['redeemed_at'])} · <code>{r['code']}</code>\n"
-            f"   {esc(r['full_name'])} · {esc(r['device'])} · "
+            f"   {'🏬 ' if r['seg'] == 'mall' else ''}{esc(r['full_name'])} · {esc(r['device'])} · "
             f"{esc(SERVICES.get(r['service'], r['service']))}"
         )
     return "\n".join(lines)
 
 
 async def export_csv() -> bytes:
-    rows = await fetchall("SELECT * FROM flyers ORDER BY id")
+    rows = await fetchall(
+        "SELECT f.*, COALESCE(c.segment,'client') seg, COALESCE(c.company,'') comp "
+        "FROM flyers f LEFT JOIN clients c ON c.tg_id=f.tg_id ORDER BY f.id")
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
     w.writerow(["код", "tg_id", "ник", "имя", "телефон", "устройство", "услуга",
-                "статус", "выдан", "действует до", "погашен", "кем погашен"])
+                "статус", "выдан", "действует до", "погашен", "кем погашен", "сегмент", "компания"])
     for r in rows:
         w.writerow([
             r["code"], r["tg_id"], r["username"], r["full_name"], "+" + r["phone"],
             r["device"], SERVICES.get(r["service"], r["service"]), eff_status(r),
             fmt(r["created_at"]), fmt(r["expires_at"]),
             fmt(r["redeemed_at"]) if r["redeemed_at"] else "", r["redeemed_by"] or "",
+            SEGMENT_TXT.get(r["seg"], r["seg"]), r["comp"],
         ])
     return ("﻿" + buf.getvalue()).encode("utf-8")  # BOM для Excel
 
@@ -619,6 +749,32 @@ async def staff_screen(note: str = ""):
     kb_rows.append([btn("➕ Добавить сотрудника", "p:add")])
     kb_rows.append(MENU_ROW)
     return text, kb_of(*kb_rows)
+
+
+async def invites_screen(bot: Bot, note: str = ""):
+    uname = await bot_username(bot)
+    rows = await fetchall("SELECT * FROM invites ORDER BY created_at DESC LIMIT 10")
+    lines = [(note + "\n") if note else "",
+             "🔗 <b>Спец-ссылки для сотрудников ТЦ</b>\n",
+             f"Каждая ссылка одноразовая: сработает только у первого, кто её откроет "
+             f"(действует {INVITE_DAYS} дн.). Пересылать её бесполезно.\n"]
+    now = now_utc()
+    for r in rows:
+        if r["used_at"]:
+            st = "✅ зарегистрирован"
+        elif r["claimed_by"]:
+            st = "⏳ открыта, ждём регистрации"
+        elif r["expires_at"] < now:
+            st = "⌛️ истекла"
+        else:
+            st = "🟡 не использована"
+        line = f"• <b>{esc(r['company'])}</b> — {st}"
+        if st.startswith("🟡"):
+            line += f"\n  <code>https://t.me/{uname}?start=i_{r['code']}</code>"
+        lines.append(line)
+    if not rows:
+        lines.append("Пока ни одной ссылки не создано.")
+    return "\n".join(lines), kb_of([btn("➕ Создать ссылку", "p:invnew")], MENU_ROW)
 
 
 @router.callback_query(F.data.startswith("p:"))
@@ -643,6 +799,19 @@ async def cb_panel(c: CallbackQuery, state: FSMContext):
             "🔎 <b>Поиск флаера</b>\n\nОтправьте код флаера (10 символов, "
             "указан под QR-кодом у клиента).",
             kb_of([btn("✖️ Отмена", "p:menu")]),
+        )
+    elif action == "inv":
+        await state.clear()
+        text, kb = await invites_screen(bot)
+        await panel_edit(bot, chat, mid, text, kb)
+    elif action == "invnew":
+        await state.set_state(Staff.invite)
+        await state.update_data(panel=mid)
+        await panel_edit(
+            bot, chat, mid,
+            "➕ <b>Новая спец-ссылка</b>\n\nНапишите, для кого она: компанию и, если нужно, "
+            "имя сотрудника. Например: <i>Магазин «Х», Иван</i>.",
+            kb_of([btn("✖️ Отмена", "p:inv")]),
         )
     elif action == "stats":
         await panel_edit(bot, chat, mid, await stats_text(),
@@ -691,6 +860,37 @@ async def staff_code_input(m: Message, state: FSMContext):
         pass
     code = re.sub(r"\s+", "", m.text).upper()
     text, kb = await build_card(m.bot, code)
+    if panel:
+        await panel_edit(m.bot, m.chat.id, panel, text, kb)
+    else:
+        await m.answer(text, reply_markup=kb)
+
+
+@router.message(Staff.invite, F.text)
+async def staff_invite_input(m: Message, state: FSMContext):
+    if not await is_staff(m.from_user.id):
+        return
+    panel = (await state.get_data()).get("panel")
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    company = " ".join(m.text.split())
+    if not 2 <= len(company) <= 60:
+        if panel:
+            await panel_edit(m.bot, m.chat.id, panel,
+                             "❌ Название должно быть от 2 до 60 символов. Попробуйте ещё раз.",
+                             kb_of([btn("✖️ Отмена", "p:inv")]))
+        return
+    await state.clear()
+    code = await create_invite(company, m.from_user.id)
+    link = f"https://t.me/{await bot_username(m.bot)}?start=i_{code}"
+    text = (
+        f"✅ Ссылка для <b>{esc(company)}</b> создана:\n\n<code>{link}</code>\n\n"
+        f"Нажмите на ссылку, чтобы скопировать, и отправьте человеку. Она одноразовая: "
+        f"привяжется к первому, кто её откроет, и действует {INVITE_DAYS} дн."
+    )
+    kb = kb_of([btn("➕ Создать ещё", "p:invnew")], [btn("📋 Все ссылки", "p:inv")], MENU_ROW)
     if panel:
         await panel_edit(m.bot, m.chat.id, panel, text, kb)
     else:
