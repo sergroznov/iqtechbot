@@ -57,6 +57,58 @@ SERVICES = {
     "clean": "Чистка и чекап устройства",
 }
 
+CATEGORIES = [
+    ("shops", "🛍 Магазины"),
+    ("food", "🍔 Кафе и рестораны"),
+    ("services", "💼 Услуги"),
+    ("fun", "🎮 Спорт и развлечения"),
+    ("other", "➕ Другая (администрация и др.)"),
+]
+CAT_NAME = dict(CATEGORIES)
+PAGE = 10
+
+# Стартовый список компаний ТЦ (заполняется один раз, дальше правится в панели)
+SEED = {
+    "shops": [
+        ("Campione", 2), ("SELA", 2), ("Zielinski&Rozen", 1), ("Аптека 36,6", 1),
+        ("Детский мир", 2), ("КуулКлевер", 1), ("Перекресток", 1), ("Элизе", 1),
+        ("Зоозавр", 1), ("Летуаль", 1), ("Оптимист Оптика", 1), ("Икорный", 1),
+        ("Алёнка", 1), ("Marc & André", 1), ("MIUZ Diamonds", 1), ("Storiz", 2),
+        ("Комната сладостей", 1), ("Evola", 2), ("Читай город", 2), ("Азбука вкуса", 2),
+        ("Amareta", 2), ("Togas", 1), ("Секретный сад", 2), ("2банки", 3),
+        ("Золотое Яблоко (пункт выдачи)", 1), ("Табак", 1), ("DNS", 2),
+        ("Лаборатория парфюма", 1), ("ПАЛЕРМО", 1), ("Арбатская сказка", 2),
+    ],
+    "food": [
+        ("BAO BEI", 1), ("Frank by Баста", 1), ("French Bakery", 1), ("Итальяно", 1),
+        ("Грузинская кухня", 1), ("PhoNgon", 1), ("Ростикс", 2), ("Топ том ям", 1),
+        ("Бургер Кинг", 2), ("Китайский чайник", 1),
+        ("Кулинарная лавка братьев Караваевых", 1), ("Нон", 1), ("Сыроварня", 1),
+        ("Теремок", 1), ("PIMS", 1), ("Лайки.Бургер", 1), ("Art Doner", 1),
+        ("Стрелка", 1), ("Mosdesserts", 1), ("Bageatteria", 1), ("Турецкая лавка", 1),
+        ("ZИL bar", 1), ("Милти", 1), ("ДоДо пицца", 1), ("Тануки", 1),
+        ("GyrozzGorilloz", 1),
+    ],
+    "services": [
+        ("Anextour", 1), ("Selfie Nail & Beauty Club", 1), ("Барбершоп «Раздевалка»", 1),
+        ("Салон цифровой экосистемы МТС", 1), ("Т2Мобайл", 1), ("Химчистка Caritta", 1),
+        ("Форабанк", 1), ("First Step", 2), ("Салон «Билайн»", 1), ("Сбербанк", 2),
+        ("ВТБ", 2), ("Т-банк", 2), ("Альфа Банк", 2), ("Светлана Ситникова", 3),
+        ("Ozon", 1), ("Автосалон «Х-Авто»", 2), ("Фотостудия/лофт Эскимо", 3),
+        ("Офтальмологическая клиника Review", 3), ("Студия гидромассажа «АКВАБЬЮТИ»", 2),
+    ],
+    "fun": [
+        ("Yobody Fitness", 3), ("Европейский Гимнастический Центр", 3),
+        ("Компьютерный клуб Cyber Rush", 3), ("Студия-школа Аллы Духовой Тодес", 3),
+        ("MetaRacing", 3), ("VR-арена Another World", 3), ("Аква Пупс", 2),
+        ("Клуб единоборств BRAVE", 2), ("PiPong", 2),
+    ],
+    "other": [
+        ("Администрация ТЦ", None), ("Охрана", None),
+        ("Клининг и технический персонал", None), ("Другая организация", None),
+    ],
+}
+
 log = logging.getLogger("flyerbot")
 router = Router()
 db: aiosqlite.Connection | None = None
@@ -86,8 +138,16 @@ def norm_phone(raw: str) -> str:
     return d
 
 
-def make_qr(link: str) -> bytes:
-    img = qrcode.make(link, box_size=12, border=3)
+def make_qr(link: str, box: int = 12, border: int = 3) -> bytes:
+    img = qrcode.make(link, box_size=box, border=border)
+    buf = io.BytesIO()
+    img.save(buf)
+    return buf.getvalue()
+
+
+def make_qr_svg(link: str) -> bytes:
+    import qrcode.image.svg
+    img = qrcode.make(link, image_factory=qrcode.image.svg.SvgPathImage, border=4)
     buf = io.BytesIO()
     img.save(buf)
     return buf.getvalue()
@@ -142,6 +202,22 @@ CREATE TABLE IF NOT EXISTS invites(
     claimed_at TEXT,
     used_at TEXT
 );
+CREATE TABLE IF NOT EXISTS companies(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    name TEXT NOT NULL,
+    floor INTEGER,
+    active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(category, name)
+);
+CREATE TABLE IF NOT EXISTS settings(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mall_intents(
+    tg_id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -156,6 +232,15 @@ async def init_db():
     await db.execute(
         "INSERT OR IGNORE INTO clients(tg_id,username,full_name,phone,segment,created_at,last_seen) "
         "SELECT tg_id,username,full_name,phone,'client',created_at,created_at FROM flyers")
+    n = (await fetchone("SELECT COUNT(*) n FROM companies"))["n"]
+    if n == 0:  # первичное заполнение списка компаний
+        for cat, items in SEED.items():
+            for name, floor in items:
+                await db.execute(
+                    "INSERT OR IGNORE INTO companies(category,name,floor) VALUES(?,?,?)",
+                    (cat, name, floor))
+    await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('mall_code',?)",
+                     (secrets.token_hex(4).upper(),))
     await db.commit()
 
 
@@ -216,6 +301,34 @@ async def set_client_phone(tg_id: int, phone: str):
 
 async def get_client(tg_id: int):
     return await fetchone("SELECT * FROM clients WHERE tg_id=?", (tg_id,))
+
+
+async def get_setting(key: str) -> str:
+    return (await fetchone("SELECT value FROM settings WHERE key=?", (key,)))["value"]
+
+
+async def list_companies(cat: str, active_only: bool = True):
+    q = "SELECT * FROM companies WHERE category=?" + (" AND active=1" if active_only else "")
+    rows = await fetchall(q, (cat,))
+    return sorted(rows, key=lambda r: r["name"].casefold())
+
+
+def page_slice(items, page: int):
+    pages = max(1, (len(items) + PAGE - 1) // PAGE)
+    page = min(max(page, 0), pages - 1)
+    return items[page * PAGE:(page + 1) * PAGE], page, pages
+
+
+async def pending_invite(tg_id: int):
+    return await fetchone(
+        "SELECT * FROM invites WHERE claimed_by=? AND used_at IS NULL", (tg_id,))
+
+
+async def needs_company(tg_id: int) -> bool:
+    """Пришёл по печатному коду для сотрудников ТЦ и ещё не выбрал компанию."""
+    if await pending_invite(tg_id):
+        return False
+    return await fetchone("SELECT 1 FROM mall_intents WHERE tg_id=?", (tg_id,)) is not None
 
 
 async def create_invite(company: str, created_by: int) -> str:
@@ -321,6 +434,7 @@ class Form(StatesGroup):
     phone = State()
     device = State()
     service = State()
+    company = State()
 
 
 def phone_kb():
@@ -439,6 +553,12 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
                 "⚠️ Эта персональная ссылка уже использована или недействительна. "
                 "Вы можете получить флаер как обычный клиент."
             )
+    if arg.startswith("m_") and await get_flyer_by_tg(uid) is None:
+        if arg[2:].upper() == await get_setting("mall_code"):
+            await execute("INSERT OR REPLACE INTO mall_intents(tg_id,created_at) VALUES(?,?)",
+                          (uid, now_utc()))
+        else:
+            await m.answer("⚠️ Этот код устарел. Вы можете получить флаер как обычный клиент.")
     await client_entry(m.bot, uid, state)
 
 
@@ -513,19 +633,111 @@ async def got_service(c: CallbackQuery, state: FSMContext):
         await c.answer()
         await client_entry(c.bot, uid, state, with_image=False)
         return
-    username = f"@{c.from_user.username}" if c.from_user.username else ""
-    code = await create_flyer(
-        uid, username, c.from_user.full_name, data["phone"], data["device"], key
-    )
-    await state.clear()
     await c.answer()
-    if not code:
-        await c.message.answer("Флаер для вас или для этого номера уже оформлен.")
+    await state.update_data(service=key)
+    if await needs_company(uid):
+        await state.set_state(Form.company)
+        await safe_edit(c.message, "🏬 Выберите категорию, в которой работает ваша компания:",
+                        cat_kb())
         return
-    await touch_client(c.from_user)
-    await finalize_invite(uid)
-    await c.message.edit_reply_markup(reply_markup=None)
-    await send_flyer(c.bot, uid, await get_flyer(code))
+    await issue_flyer(c.bot, c.from_user, c.message, state)
+
+
+async def safe_edit(msg: Message, text: str, kb=None):
+    try:
+        await msg.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            log.warning("edit failed: %s", e)
+
+
+async def issue_flyer(bot: Bot, user, msg: Message, state: FSMContext, company: str | None = None):
+    data = await state.get_data()
+    uid = user.id
+    username = f"@{user.username}" if user.username else ""
+    code = await create_flyer(uid, username, user.full_name, data["phone"],
+                              data["device"], data["service"])
+    await state.clear()
+    if not code:
+        await msg.answer("Флаер для вас или для этого номера уже оформлен.")
+        return
+    await touch_client(user)
+    if company:
+        await execute("UPDATE clients SET segment='mall', company=? WHERE tg_id=?",
+                      (company, uid))
+    else:
+        await finalize_invite(uid)
+    await execute("DELETE FROM mall_intents WHERE tg_id=?", (uid,))
+    try:
+        await msg.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await send_flyer(bot, uid, await get_flyer(code))
+
+
+def cat_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=f"co:c:{key}:0")]
+                         for key, label in CATEGORIES])
+
+
+def pager_row(prefix: str, page: int, pages: int):
+    if pages <= 1:
+        return None
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(text="⬅️", callback_data=f"{prefix}:{page - 1}"))
+    row.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        row.append(InlineKeyboardButton(text="➡️", callback_data=f"{prefix}:{page + 1}"))
+    return row
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(c: CallbackQuery):
+    await c.answer()
+
+
+@router.callback_query(Form.company, F.data.startswith("co:"))
+async def cb_company(c: CallbackQuery, state: FSMContext):
+    parts = c.data.split(":")
+    act = parts[1]
+    await c.answer()
+    if act == "cats":
+        await safe_edit(c.message, "🏬 Выберите категорию, в которой работает ваша компания:",
+                        cat_kb())
+    elif act == "c":
+        key, page = parts[2], int(parts[3])
+        items, page, pages = page_slice(await list_companies(key), page)
+        rows = [[InlineKeyboardButton(text=r["name"], callback_data=f"co:p:{r['id']}")]
+                for r in items]
+        pr = pager_row(f"co:c:{key}", page, pages)
+        if pr:
+            rows.append(pr)
+        rows.append([InlineKeyboardButton(text="↩️ К категориям", callback_data="co:cats")])
+        await safe_edit(c.message, f"{CAT_NAME.get(key, '')}\n\nНайдите свою компанию в списке:",
+                        InlineKeyboardMarkup(inline_keyboard=rows))
+    elif act == "p":
+        co = await fetchone("SELECT * FROM companies WHERE id=? AND active=1", (int(parts[2]),))
+        if not co:
+            await c.message.answer("Компания не найдена. Нажмите /start и попробуйте снова.")
+            return
+        await safe_edit(
+            c.message, f"Ваша компания: <b>{esc(co['name'])}</b>. Всё верно?",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да", callback_data=f"co:ok:{co['id']}"),
+                 InlineKeyboardButton(text="↩️ Назад", callback_data=f"co:c:{co['category']}:0")]]))
+    elif act == "ok":
+        co = await fetchone("SELECT * FROM companies WHERE id=? AND active=1", (int(parts[2]),))
+        if not co:
+            await c.message.answer("Компания не найдена. Нажмите /start и попробуйте снова.")
+            return
+        await issue_flyer(c.bot, c.from_user, c.message, state, company=co["name"])
+
+
+@router.callback_query(F.data.startswith("co:"))
+async def cb_company_stale(c: CallbackQuery):
+    await c.answer("Сессия устарела, нажмите /start", show_alert=True)
 
 
 @router.message(Form.service)
@@ -538,6 +750,7 @@ class Staff(StatesGroup):
     code = State()
     add_id = State()
     invite = State()
+    company = State()
 
 
 STATUS_TXT = {
@@ -570,6 +783,7 @@ def menu_kb(admin: bool) -> InlineKeyboardMarkup:
     ]
     if admin:
         rows.append([btn("👥 Сотрудники", "p:staff"), btn("📥 Выгрузка CSV", "p:export")])
+        rows.append([btn("🏬 Компании ТЦ", "p:cos"), btn("🖨 Флаер для ТЦ", "p:print")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -599,7 +813,9 @@ async def build_card(bot: Bot, code: str):
     cl = await get_client(f["tg_id"])
     plate = ""
     if cl and cl["segment"] == "mall":
-        plate = (f"🏬 <b>СОТРУДНИК ТЦ · {esc(cl['company'])}</b>\n"
+        co = await fetchone("SELECT * FROM companies WHERE name=?", (cl["company"],))
+        where = f" ({co['floor']} этаж)" if co and co["floor"] else ""
+        plate = (f"🏬 <b>СОТРУДНИК ТЦ · {esc(cl['company'])}</b>{where}\n"
                  "Тарифы для сотрудников ТЦ, сверьте бейдж/пропуск.\n\n")
     text = (
         f"🎟 <b>Флаер {f['code']}</b>\n"
@@ -686,6 +902,15 @@ async def stats_text() -> str:
     for key in ("client", "mall"):
         t, u = d.get(key, (0, 0))
         lines.append(f"{SEGMENT_TXT[key]}: {t} / {u}")
+    cats = await fetchall(
+        "SELECT COALESCE(co.category,'other') cat, COUNT(*) t, "
+        "SUM(CASE WHEN f.status='redeemed' THEN 1 ELSE 0 END) u "
+        "FROM flyers f JOIN clients c ON c.tg_id=f.tg_id AND c.segment='mall' "
+        "LEFT JOIN companies co ON co.name=c.company GROUP BY cat")
+    if cats:
+        lines += ["", "<b>Сотрудники ТЦ по категориям (выдано / погашено):</b>"]
+        lines += [f"{esc(CAT_NAME.get(r['cat'], r['cat']))}: {r['t']} / {r['u']}"
+                  for r in cats]
     comp = await fetchall(
         "SELECT c.company co, COUNT(*) t, "
         "SUM(CASE WHEN f.status='redeemed' THEN 1 ELSE 0 END) u "
@@ -751,6 +976,48 @@ async def staff_screen(note: str = ""):
     return text, kb_of(*kb_rows)
 
 
+async def mall_link(bot: Bot) -> str:
+    return f"https://t.me/{await bot_username(bot)}?start=m_{await get_setting('mall_code')}"
+
+
+async def print_screen(bot: Bot, note: str = ""):
+    link = await mall_link(bot)
+    text = ((note + "\n\n") if note else "") + (
+        "🖨 <b>Флаер для сотрудников ТЦ</b>\n\n"
+        "Общая ссылка для печати (по ней клиент выбирает свою компанию из списка и "
+        f"получает отметку «сотрудник ТЦ»):\n\n<code>{link}</code>\n\n"
+        "Нажмите «Прислать QR», чтобы получить код в PNG и SVG для печати.")
+    return text, kb_of([btn("📥 Прислать QR", "p:printqr")],
+                       [btn("🔄 Перевыпустить код", "p:printnew")], MENU_ROW)
+
+
+async def cos_screen():
+    rows = []
+    for key, label in CATEGORIES:
+        a = (await fetchone("SELECT COUNT(*) n FROM companies WHERE category=? AND active=1",
+                            (key,)))["n"]
+        t = (await fetchone("SELECT COUNT(*) n FROM companies WHERE category=?", (key,)))["n"]
+        rows.append([btn(f"{label} ({a}/{t})" if a != t else f"{label} ({t})", f"p:cc:{key}:0")])
+    rows.append(MENU_ROW)
+    return ("🏬 <b>Компании ТЦ</b>\n\nИз этого списка клиенты выбирают место работы. "
+            "Выберите категорию:"), kb_of(*rows)
+
+
+async def cat_screen(key: str, page: int = 0, note: str = ""):
+    items, page, pages = page_slice(await list_companies(key, active_only=False), page)
+    rows = [[btn(("🚫 " if not r["active"] else "") + r["name"], f"p:co:{r['id']}")]
+            for r in items]
+    pr = pager_row(f"p:cc:{key}", page, pages)
+    if pr:
+        rows.append(pr)
+    rows.append([btn("➕ Добавить компанию", f"p:coadd:{key}")])
+    rows.append([btn("↩️ Категории", "p:cos")])
+    text = ((note + "\n\n") if note else "") + (
+        f"{esc(CAT_NAME.get(key, key))}\n\nНажмите на компанию, чтобы скрыть или удалить. "
+        "🚫 — скрыта из списка.")
+    return text, kb_of(*rows)
+
+
 async def invites_screen(bot: Bot, note: str = ""):
     uname = await bot_username(bot)
     rows = await fetchall("SELECT * FROM invites ORDER BY created_at DESC LIMIT 10")
@@ -800,6 +1067,78 @@ async def cb_panel(c: CallbackQuery, state: FSMContext):
             "указан под QR-кодом у клиента).",
             kb_of([btn("✖️ Отмена", "p:menu")]),
         )
+    elif action == "cos" and admin:
+        await state.clear()
+        text, kb = await cos_screen()
+        await panel_edit(bot, chat, mid, text, kb)
+    elif action.startswith("cc:") and admin:
+        _, key, page = action.split(":")
+        text, kb = await cat_screen(key, int(page))
+        await panel_edit(bot, chat, mid, text, kb)
+    elif action.startswith("co:") and admin:
+        co = await fetchone("SELECT * FROM companies WHERE id=?", (int(action.split(":")[1]),))
+        if co:
+            st = "показывается в списке" if co["active"] else "скрыта из списка"
+            fl = f"{co['floor']} этаж" if co["floor"] else "этаж не указан"
+            await panel_edit(
+                bot, chat, mid,
+                f"🏬 <b>{esc(co['name'])}</b>\n{esc(CAT_NAME[co['category']])} · {fl}\n"
+                f"Сейчас: {st}",
+                kb_of([btn("🙈 Скрыть" if co["active"] else "👁 Показать", f"p:cotg:{co['id']}"),
+                       btn("🗑 Удалить", f"p:codel:{co['id']}")],
+                      [btn("↩️ Назад", f"p:cc:{co['category']}:0")]))
+    elif action.startswith("cotg:") and admin:
+        cid = int(action.split(":")[1])
+        await execute("UPDATE companies SET active=1-active WHERE id=?", (cid,))
+        co = await fetchone("SELECT * FROM companies WHERE id=?", (cid,))
+        text, kb = await cat_screen(co["category"], 0, "✅ Готово")
+        await panel_edit(bot, chat, mid, text, kb)
+    elif action.startswith("codel:") and admin:
+        cid = int(action.split(":")[1])
+        co = await fetchone("SELECT * FROM companies WHERE id=?", (cid,))
+        if co:
+            await panel_edit(
+                bot, chat, mid,
+                f"Удалить «{esc(co['name'])}» из списка? У клиентов, которые её уже выбрали, "
+                "название сохранится.",
+                kb_of([btn("✅ Да, удалить", f"p:codel2:{cid}"), btn("↩️ Нет", f"p:co:{cid}")]))
+    elif action.startswith("codel2:") and admin:
+        cid = int(action.split(":")[1])
+        co = await fetchone("SELECT * FROM companies WHERE id=?", (cid,))
+        await execute("DELETE FROM companies WHERE id=?", (cid,))
+        text, kb = await cat_screen(co["category"] if co else "other", 0, "🗑 Удалено")
+        await panel_edit(bot, chat, mid, text, kb)
+    elif action.startswith("coadd:") and admin:
+        key = action.split(":")[1]
+        await state.set_state(Staff.company)
+        await state.update_data(panel=mid, cat=key)
+        await panel_edit(
+            bot, chat, mid,
+            f"➕ <b>Новая компания</b>\n{esc(CAT_NAME.get(key, ''))}\n\n"
+            "Отправьте название. Если нужно указать этаж, добавьте его через ` | `, "
+            "например: <i>Кофейня Х | 2</i>",
+            kb_of([btn("✖️ Отмена", f"p:cc:{key}:0")]))
+    elif action == "print" and admin:
+        text, kb = await print_screen(bot)
+        await panel_edit(bot, chat, mid, text, kb)
+    elif action == "printqr" and admin:
+        link = await mall_link(bot)
+        await bot.send_document(chat, BufferedInputFile(make_qr(link, box=24, border=4),
+                                                        filename="qr_flyer_tc.png"))
+        await bot.send_document(chat, BufferedInputFile(make_qr_svg(link),
+                                                        filename="qr_flyer_tc.svg"),
+                                caption="Векторный QR для типографии")
+    elif action == "printnew" and admin:
+        await panel_edit(
+            bot, chat, mid,
+            "🔄 <b>Перевыпустить код?</b>\n\nСтарый QR на уже напечатанных флаерах "
+            "перестанет работать. Сделайте это, только если код попал не в те руки.",
+            kb_of([btn("✅ Да, перевыпустить", "p:printnew2"), btn("↩️ Нет", "p:print")]))
+    elif action == "printnew2" and admin:
+        await execute("UPDATE settings SET value=? WHERE key='mall_code'",
+                      (secrets.token_hex(4).upper(),))
+        text, kb = await print_screen(bot, "✅ Новый код создан. Отправьте QR в печать заново.")
+        await panel_edit(bot, chat, mid, text, kb)
     elif action == "inv":
         await state.clear()
         text, kb = await invites_screen(bot)
@@ -860,6 +1199,36 @@ async def staff_code_input(m: Message, state: FSMContext):
         pass
     code = re.sub(r"\s+", "", m.text).upper()
     text, kb = await build_card(m.bot, code)
+    if panel:
+        await panel_edit(m.bot, m.chat.id, panel, text, kb)
+    else:
+        await m.answer(text, reply_markup=kb)
+
+
+@router.message(Staff.company, F.text)
+async def staff_company_input(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    data = await state.get_data()
+    panel, key = data.get("panel"), data.get("cat", "other")
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    name, _, fl = m.text.partition("|")
+    name = " ".join(name.split())
+    floor = int(fl.strip()) if fl.strip().isdigit() else None
+    if not 2 <= len(name) <= 60:
+        if panel:
+            await panel_edit(m.bot, m.chat.id, panel,
+                             "❌ Название должно быть от 2 до 60 символов. Попробуйте ещё раз.",
+                             kb_of([btn("✖️ Отмена", f"p:cc:{key}:0")]))
+        return
+    await state.clear()
+    n = await execute("INSERT OR IGNORE INTO companies(category,name,floor) VALUES(?,?,?)",
+                      (key, name, floor))
+    note = f"✅ «{esc(name)}» добавлена" if n else f"ℹ️ «{esc(name)}» уже есть в списке"
+    text, kb = await cat_screen(key, 0, note)
     if panel:
         await panel_edit(m.bot, m.chat.id, panel, text, kb)
     else:
